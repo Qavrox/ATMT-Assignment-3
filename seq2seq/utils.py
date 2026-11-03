@@ -34,18 +34,22 @@ def load_embedding(embed_path, tokenizer):
     return embedding
 
 
-def move_to_cuda(sample):
+def move_to_device(sample, device):
     if torch.is_tensor(sample):
-        return sample.cuda()
+        return sample.to(device)
     elif isinstance(sample, list):
-        return [move_to_cuda(x) for x in sample]
+        return [move_to_device(x, device) for x in sample]
     elif isinstance(sample, dict):
-        return {key: move_to_cuda(value) for key, value in sample.items()}
+        return {key: move_to_device(value, device) for key, value in sample.items()}
     else:
         return sample
 
 
-def save_checkpoint(args, model, optimizer, epoch, valid_loss):
+def move_to_cuda(sample):
+    return move_to_device(sample, 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'))
+
+
+def save_checkpoint(args, model, optimizer, epoch, valid_loss, lr_scheduler=None):
     os.makedirs(args.save_dir, exist_ok=True)
     last_epoch = getattr(save_checkpoint, 'last_epoch', -1)
     save_checkpoint.last_epoch = max(last_epoch, epoch)
@@ -61,6 +65,8 @@ def save_checkpoint(args, model, optimizer, epoch, valid_loss):
         'optimizer': optimizer.state_dict(),
         'args': args,
     }
+    if lr_scheduler is not None:
+        state_dict['lr_scheduler'] = lr_scheduler.state_dict()
 
     if args.epoch_checkpoints and epoch % args.save_interval == 0:
         torch.save(state_dict, os.path.join(args.save_dir, 'checkpoint{}_{:.3f}.pt'.format(epoch, valid_loss)))
@@ -70,14 +76,16 @@ def save_checkpoint(args, model, optimizer, epoch, valid_loss):
         torch.save(state_dict, os.path.join(args.save_dir, 'checkpoint_last.pt'))
 
 
-def load_checkpoint(args, model, optimizer):
+def load_checkpoint(args, model, optimizer, lr_scheduler=None):
     checkpoint_path = os.path.join(args.save_dir, args.restore_file)
     if os.path.isfile(checkpoint_path):
         state_dict = torch.load(checkpoint_path, map_location=lambda s, l: default_restore_location(s, 'cpu'), weights_only=False)
         model.load_state_dict(state_dict['model'])
         optimizer.load_state_dict(state_dict['optimizer'])
-        save_checkpoint.best_loss = state_dict['best_loss']
-        save_checkpoint.last_epoch = state_dict['last_epoch']
+        if lr_scheduler is not None and 'lr_scheduler' in state_dict:
+            lr_scheduler.load_state_dict(state_dict['lr_scheduler'])
+        save_checkpoint.best_loss = state_dict.get('best_loss', float('inf'))
+        save_checkpoint.last_epoch = state_dict.get('last_epoch', -1)
         logging.info('Loaded checkpoint {}'.format(checkpoint_path))
         return state_dict
 

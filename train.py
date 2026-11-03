@@ -45,6 +45,9 @@ def get_args():
     parser.add_argument('--max-epoch', default=10000, type=int, help='force stop training at specified epoch')
     parser.add_argument('--clip-norm', default=4.0, type=float, help='clip threshold of gradients')
     parser.add_argument('--lr', default=0.0003, type=float, help='learning rate')
+    parser.add_argument('--warmup-strategy', default='none', choices=['none', 'linear', 'constant'],
+                        help='learning rate warmup strategy (none, linear, constant)')
+    parser.add_argument('--warmup-steps', default=500, type=int, help='number of warmup steps for lr scheduler')
     parser.add_argument('--patience', default=3, type=int,
                         help='number of epochs without improvement on validation set before early stopping')
     parser.add_argument('--max-length', default=300, type=int, help='maximum output sequence length during testing')
@@ -85,27 +88,42 @@ def main(args):
     tgt_tokenizer = utils.load_tokenizer(args.tgt_tokenizer)
 
     train_dataset = load_data(split='train') if not args.train_on_tiny else load_data(split='tiny_train')
-    valid_dataset = load_data(split='valid')
+    valid_dataset = load_data(split='valid') if not args.train_on_tiny else load_data(split='tiny_valid')
 
     model = models.build_model(args, src_tokenizer, tgt_tokenizer)
     logging.info('Built a model with {:d} parameters'.format(sum(p.numel() for p in model.parameters())))
     criterion = nn.CrossEntropyLoss(ignore_index=src_tokenizer.pad_id(), reduction='sum')
 
-    # Move model to GPU if available
-    if args.cuda:
-        model = model.cuda()
-        criterion = criterion.cuda()
-
-    device = torch.device("cuda" if args.cuda else "cpu")
-    
+    device = torch.device("cuda" if args.cuda and torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
+    model = model.to(device)
+    criterion = criterion.to(device)
     
     # Instantiate optimizer and learning rate scheduler
     optimizer = torch.optim.Adam(model.parameters(), args.lr)
 
+    def get_lr_scheduler(opt, strategy, warmup_steps):
+        if strategy == 'linear':
+            def lr_lambda(step):
+                current_step = step + 1
+                if current_step <= warmup_steps:
+                    return float(current_step) / float(max(1, warmup_steps))
+                return (float(warmup_steps) / float(current_step)) ** 0.5
+            return torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
+        elif strategy == 'constant':
+            def lr_lambda(step):
+                current_step = step + 1
+                if current_step <= warmup_steps:
+                    return 0.1
+                return 1.0
+            return torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
+        return None
+
+    lr_scheduler = get_lr_scheduler(optimizer, getattr(args, 'warmup_strategy', 'none'), getattr(args, 'warmup_steps', 500))
+
     state_dict = None
     if not args.ignore_checkpoints:
         # Load last checkpoint if one exists
-        state_dict = utils.load_checkpoint(args, model, optimizer)  # lr_scheduler
+        state_dict = utils.load_checkpoint(args, model, optimizer, lr_scheduler)
     last_epoch = state_dict['last_epoch'] if state_dict is not None else -1
     
     # Track validation performance for early stopping
@@ -116,7 +134,7 @@ def main(args):
     
     for epoch in range(last_epoch + 1, args.max_epoch):
         train_loader = \
-            torch.utils.data.DataLoader(train_dataset, num_workers=1, collate_fn=train_dataset.collater,
+            torch.utils.data.DataLoader(train_dataset, num_workers=0, collate_fn=train_dataset.collater,
                                         batch_sampler=BatchSampler(train_dataset, args.max_tokens, args.batch_size, 1,
                                                                    0, shuffle=True, seed=SEED))
         model.train()
@@ -158,6 +176,8 @@ def main(args):
             loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_norm)
             optimizer.step()
+            if lr_scheduler is not None:
+                lr_scheduler.step()
             optimizer.zero_grad()
 
             # Update statistics for progress bar
@@ -185,7 +205,7 @@ def main(args):
         
         # Save checkpoints
         if epoch % args.save_interval == 0:
-            utils.save_checkpoint(args, model, optimizer, epoch, valid_perplexity)  # lr_scheduler
+            utils.save_checkpoint(args, model, optimizer, epoch, valid_perplexity, lr_scheduler)
 
         # Check whether to terminate training
         if valid_perplexity < best_validate:
@@ -198,7 +218,7 @@ def main(args):
             break
 
     # Final evaluation on the test set
-    test_dataset = load_data(split='test')
+    test_dataset = load_data(split='test') if not args.train_on_tiny else load_data(split='tiny_valid')
     logging.info('Loading the best model for final evaluation on the test set')
     utils.load_checkpoint(args, model, optimizer)
 
@@ -221,7 +241,7 @@ def validate(args, model, criterion, valid_dataset, epoch,
              tgt_tokenizer: spm.SentencePieceProcessor):
     """ Validates model performance on a held-out development set. """
     valid_loader = \
-        torch.utils.data.DataLoader(valid_dataset, num_workers=1, collate_fn=valid_dataset.collater,
+        torch.utils.data.DataLoader(valid_dataset, num_workers=0, collate_fn=valid_dataset.collater,
                                     batch_sampler=BatchSampler(valid_dataset, args.max_tokens, args.batch_size, 1, 0,
                                                                shuffle=False, seed=SEED))
     model.eval()
@@ -230,7 +250,7 @@ def validate(args, model, criterion, valid_dataset, epoch,
     stats['num_tokens'] = 0
     stats['batch_size'] = 0
 
-    device = torch.device('cuda' if args.cuda else 'cpu')
+    device = torch.device('cuda' if args.cuda and torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'))
 
     all_references = []  # list of reference strings
     all_hypotheses = []  # list of hypothesis strings
@@ -307,7 +327,7 @@ def evaluate(args, model, test_dataset,
     """
     test_loader = torch.utils.data.DataLoader(
         test_dataset,
-        num_workers=1,
+        num_workers=0,
         collate_fn=test_dataset.collater,
         # batch_size != 1 may mess things up with decoding
         batch_sampler=BatchSampler(test_dataset, args.max_tokens, batch_size=1, 
@@ -315,7 +335,7 @@ def evaluate(args, model, test_dataset,
     )
 
     model.eval()
-    device = torch.device("cuda" if args.cuda else "cpu")
+    device = torch.device('cuda' if args.cuda and torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'))
 
     all_references = []
     all_hypotheses = []
@@ -369,14 +389,13 @@ def evaluate(args, model, test_dataset,
 if __name__ == '__main__':
     args = get_args()
     args.seed = SEED
-    os.makedirs(os.path.dirname(args.log_file), exist_ok=True)
-
-    # Set up logging to file
-    logging.basicConfig(filename=args.log_file, filemode='a', level=logging.INFO,
-                        format='%(levelname)s: %(message)s')
     if args.log_file is not None:
-        # Logging to console
+        os.makedirs(os.path.dirname(args.log_file), exist_ok=True)
+        logging.basicConfig(filename=args.log_file, filemode='a', level=logging.INFO,
+                            format='%(levelname)s: %(message)s')
         console = logging.StreamHandler()
         console.setLevel(logging.INFO)
         logging.getLogger('').addHandler(console)
+    else:
+        logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
     main(args)

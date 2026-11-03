@@ -50,6 +50,7 @@ class TransformerModel(Seq2SeqModel):
         parser.add_argument('--max-seq-len', type=int, default=128, help='maximum sequence length')
         parser.add_argument('--n-encoder-layers', type=int, default=6, help='number of encoder layers')
         parser.add_argument('--n-decoder-layers', type=int, default=6, help='number of decoder layers')
+        parser.add_argument('--pos-embed-type', default='learned', choices=['learned', 'sinusoidal', 'rope'], help='Type of positional embedding')
         
     @classmethod
     def build_model(cls, args, src_tokenizer, tgt_tokenizer):
@@ -64,6 +65,7 @@ class TransformerModel(Seq2SeqModel):
         if args.decoder_embed_path:
             decoder_pretrained_embedding = utils.load_embedding(args.decoder_embed_path, tgt_tokenizer)
 
+        pos_embed_type = getattr(args, 'pos_embed_type', 'learned')
         encoder = TransformerEncoder(
             src_tokenizer=src_tokenizer,
             dim_embed=args.dim_embedding,
@@ -73,6 +75,7 @@ class TransformerModel(Seq2SeqModel):
             dim_ff=args.dim_feedforward_encoder,
             pretrained_embedding=encoder_pretrained_embedding, # currently unused
             n_encoder_layers=args.n_encoder_layers,
+            pos_embed_type=pos_embed_type,
         )
         decoder = TransformerDecoder(
             tgt_tokenizer=tgt_tokenizer,
@@ -83,12 +86,23 @@ class TransformerModel(Seq2SeqModel):
             n_decoder_layers=args.n_decoder_layers,
             dim_ff=args.dim_feedforward_decoder,
             pretrained_embedding=decoder_pretrained_embedding, # currently unused
-            use_cuda=args.cuda
+            use_cuda=args.cuda,
+            pos_embed_type=pos_embed_type,
         )
         return cls(encoder, decoder)
 
     def forward(self, src, src_mask, trg, trg_pad_mask):
         return self.decoder(self.encoder(src, src_mask), src_mask, trg, trg_pad_mask)
+
+def create_sinusoidal_embeddings(max_seq_len: int, dim_embed: int) -> torch.Tensor:
+    """Computes sinusoidal positional encodings (Vaswani et al., 2017)."""
+    pe = torch.zeros(max_seq_len, dim_embed)
+    position = torch.arange(0, max_seq_len, dtype=torch.float).unsqueeze(1)
+    div_term = torch.exp(torch.arange(0, dim_embed, 2).float() * (-math.log(10000.0) / dim_embed))
+    pe[:, 0::2] = torch.sin(position * div_term)
+    pe[:, 1::2] = torch.cos(position * div_term)
+    return pe.unsqueeze(0)
+
 
 class TransformerEncoder(Seq2SeqEncoder):
     '''Encoder = token embedding + positional embedding -> a stack of N EncoderBlock -> layer norm'''
@@ -101,7 +115,8 @@ class TransformerEncoder(Seq2SeqEncoder):
                  n_attention_heads,
                  dim_ff,
                  pretrained_embedding,
-                 n_encoder_layers):
+                 n_encoder_layers,
+                 pos_embed_type='learned'):
         # initialize parent (but since our implementation uses a )
         super().__init__(src_tokenizer)
 
@@ -109,7 +124,11 @@ class TransformerEncoder(Seq2SeqEncoder):
         
         self.dim_embed = dim_embed  # 512
         self.tok_embed = nn.Embedding(self.src_vocab_size, dim_embed)  # Vocab Dictionary size , Embed size
-        self.pos_embed = nn.Parameter(torch.zeros(1, max_seq_len, dim_embed))
+        self.pos_embed_type = pos_embed_type
+        if pos_embed_type == 'sinusoidal':
+            self.register_buffer('pos_embed', create_sinusoidal_embeddings(max_seq_len, dim_embed))
+        else:
+            self.pos_embed = nn.Parameter(torch.zeros(1, max_seq_len, dim_embed))
         self.encoder_blocks = nn.ModuleList([EncoderBlock(dim_embed, dropout, n_attention_heads, dim_ff) for _ in range(n_encoder_layers)])
         self.dropout = nn.Dropout(dropout)
         self.norm = build_rms_norm(dim_embed)
@@ -158,21 +177,28 @@ class TransformerDecoder(Seq2SeqDecoder):
                  dim_ff: int,
                 #  unused for now
                  pretrained_embedding,
-                 use_cuda: bool):
+                 use_cuda: bool,
+                 pos_embed_type: str = 'learned'):
         super().__init__(tgt_tokenizer)
         self.tgt_vocab_size = tgt_tokenizer.GetPieceSize()
         self.dim_embed = dim_embed
         self.tok_embed = nn.Embedding(self.tgt_vocab_size, dim_embed)
-        self.pos_embed = nn.Parameter(torch.zeros(1, max_seq_len, dim_embed))
+        self.pos_embed_type = pos_embed_type
+        if pos_embed_type == 'sinusoidal':
+            self.register_buffer('pos_embed', create_sinusoidal_embeddings(max_seq_len, dim_embed))
+        else:
+            self.pos_embed = nn.Parameter(torch.zeros(1, max_seq_len, dim_embed))
         self.dropout = nn.Dropout(dropout)
         self.decoder_blocks = nn.ModuleList([DecoderBlock( dim_embed, n_attention_heads, dropout, dim_ff ) for _ in range(n_decoder_layers)])
         self.norm = build_rms_norm(dim_embed)
         self.linear = nn.Linear(dim_embed, self.tgt_vocab_size)
-        self.device = torch.device("cuda" if use_cuda else "cpu")
+        self.device = torch.device("cuda" if use_cuda and torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
     
-    def future_mask(self, seq_len: int):
+    def future_mask(self, seq_len: int, device: torch.device = None):
         '''mask out tokens at future positions'''
-        mask = (torch.triu(torch.ones(seq_len, seq_len, requires_grad=False), diagonal=1)!=0).to(self.device)
+        if device is None:
+            device = self.pos_embed.device
+        mask = torch.triu(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool), diagonal=1)
         return mask.view(1, 1, seq_len, seq_len)
 
     def forward(self, encoder_out: torch.Tensor, src_mask: torch.Tensor, trg: torch.Tensor, trg_pad_mask: torch.Tensor):
@@ -183,7 +209,7 @@ class TransformerDecoder(Seq2SeqDecoder):
             trg_pad_mask = trg_pad_mask[:, :, :max_len]  # keep masks aligned
 
         seq_len = trg.size(1)
-        trg_mask = torch.logical_or(trg_pad_mask, self.future_mask(seq_len))
+        trg_mask = torch.logical_or(trg_pad_mask, self.future_mask(seq_len, trg.device))
         x = self.tok_embed(trg) + self.pos_embed[:, :trg.size(1), :]
         x = self.dropout(x)
         for layer in self.decoder_blocks:
@@ -283,3 +309,4 @@ def base_architecture(args):
     args.max_seq_len = getattr(args, 'max_seq_len', 512)
     args.n_encoder_layers = getattr(args, 'n_encoder_layers', 6)
     args.n_decoder_layers = getattr(args, 'n_decoder_layers', 6)
+    args.pos_embed_type = getattr(args, 'pos_embed_type', 'learned')

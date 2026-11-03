@@ -151,8 +151,8 @@ def main(args):
     
     # Build model and criterion
     model = models.build_model(args, src_tokenizer, tgt_tokenizer)
-    if args.cuda:
-        model = model.cuda()
+    DEVICE = 'cuda' if args.cuda and torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu')
+    model = model.to(DEVICE)
     model.eval()
     model.load_state_dict(state_dict['model'])
     logging.info('Loaded a model from checkpoint {:s}'.format(args.checkpoint_path))
@@ -171,7 +171,7 @@ def main(args):
     # src_encoded = [s[:max_seq_len] for s in src_encoded]
     src_encoded = [s if len(s)<=max_seq_len else s[:max_seq_len] for s in src_encoded]
 
-    DEVICE = 'cuda' if args.cuda else 'cpu'
+    # DEVICE already set above based on hardware availability
     PAD = src_tokenizer.pad_id()
     BOS = tgt_tokenizer.bos_id()
     EOS = tgt_tokenizer.eos_id()
@@ -211,6 +211,11 @@ def main(args):
 
     translations = []
     start_time = time.perf_counter()
+
+    if args.output is not None:
+        os.makedirs(os.path.dirname(args.output) if os.path.dirname(args.output) else '.', exist_ok=True)
+        with open(args.output, 'w', encoding='utf-8') as f:
+            pass
 
     make_batch = utils.make_batch_input(device=DEVICE, pad=src_tokenizer.pad_id(), max_seq_len=args.max_len)
 
